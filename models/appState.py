@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import asyncio
-from typing import Dict
+from typing import Dict, Optional
+import redis.asyncio as aioredis
 
 from models.machine import Machine
 from models.task import Task
@@ -11,17 +12,16 @@ class AppState:
     system_ready: asyncio.Event = field(default_factory=asyncio.Event)
     shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
 
+    redis: aioredis.Redis = None
     machines: Dict[int, Machine] = field(default_factory=dict)
     machines_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    
-    next_machine_id: int = 1
-    id_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    tasks_to_run: asyncio.Queue[Task] = field(default_factory=asyncio.Queue)
-    task_id_counter: int = 1
-    task_id_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    running_tasks: Dict[int, asyncio.Task] = field(default_factory=dict)
-    running_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    async def get_machine(self, machine_id: int) -> Optional[dict]:
+        machine_data = await self.redis.hgetall(f"machine:{machine_id}")
+        if not machine_data:
+            return None
+        return machine_data
+        
+    async def set_machine_status(self, machine_id: int, status: str) -> None:
+        await self.redis.hset(f"machine:{machine_id}", "status", status)
 
-    # external concurrency limiter (נשתמש בשלב הבא)
-    external_sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(5))

@@ -1,15 +1,16 @@
 import asyncio
 import hashlib
+import json
 import random
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from models import task
 from models.appState import AppState
 from models.enums.machineStatus import MachineStatus
 from models.enums.taskType import TaskType
+from models.machine import Machine
 from models.task import Task
-
-
 
 
 async def do_sleep(payload: str) -> str:
@@ -18,35 +19,35 @@ async def do_sleep(payload: str) -> str:
     return f"slept:{ms}ms"
 
 async def turn_on_machine(machine_id: int, state: AppState) -> str:
-    async with state.machines_lock:
-        machine = state.machines.get(machine_id)
-        if machine is None:
-            return f"error: machine {machine_id} not found"
-        if machine.status == MachineStatus.UP:
-            return f"machine {machine_id} already ON"
-        
-    await do_sleep("1000") 
-
-    async with state.machines_lock:
-        machine = state.machines.get(machine_id)  # Re-fetch
-        if machine:
-            machine.status = MachineStatus.UP
+    machine_data = await state.get_machine(machine_id)
+    print(f"DEBUG: get_machine({machine_id}) returned: {machine_data} (type: {type(machine_data)})", flush=True)
+    if not machine_data:
+        return f"error: machine {machine_id} not found"
+    
+    current_status = machine_data.get(b"status", b"").decode("utf-8")
+    if current_status == MachineStatus.UP.value:
+        return f"machine {machine_id} already ON"
+    
+    await do_sleep("10000")
+    
+    await state.set_machine_status(machine_id, MachineStatus.UP.value)
     return f"machine {machine_id} turned ON"
+    
 
 async def turn_off_machine(machine_id: int, state: AppState) -> str:
-    async with state.machines_lock:
-        machine = state.machines.get(machine_id)
-        if machine is None:
-            return f"error: machine {machine_id} not found"
-        if machine.status == MachineStatus.DOWN:
-            return f"machine {machine_id} already OFF"
-        
-    await do_sleep("1000")  
-    async with state.machines_lock:
-        machine = state.machines.get(machine_id)  
-        if machine:
-            machine.status = MachineStatus.DOWN
+    machine_data = await state.get_machine(machine_id)
+    if not machine_data:
+        return f"error: machine {machine_id} not found"
+    
+    current_status = machine_data.get(b"status", b"").decode("utf-8")
+    if current_status == MachineStatus.DOWN.value:
+        return f"machine {machine_id} already OFF"
+    
+    await do_sleep("1000")
+    
+    await state.set_machine_status(machine_id, MachineStatus.DOWN.value)
     return f"machine {machine_id} turned OFF"
+
       
 
 
@@ -55,14 +56,12 @@ async def process_tasks(state: AppState, task: Task) -> None:
         print(f"Processing task {task.id}: {task.command} on machine {task.machine_id}")
         if task.command == TaskType.START:
             result = await turn_on_machine(task.machine_id, state)
-            async with state.task_id_lock:
-                tid = state.task_id_counter
-                state.task_id_counter += 1
-            await state.tasks_to_run.put(Task(
-                id=tid,
-                machine_id=task.machine_id,
-                command=TaskType.STOP
-            ))
+            tid = int(await state.redis.incr("task_id_counter"))
+            await state.redis.lpush("tasks_queue", json.dumps({
+                "id": tid,
+                "machine_id": task.machine_id,
+                "command": "STOP"  # Use string
+            }))
         elif task.command == TaskType.STOP:
             result = await turn_off_machine(task.machine_id, state)
         else:
@@ -73,23 +72,30 @@ async def process_tasks(state: AppState, task: Task) -> None:
         return
 
 async def worker_loop(state: AppState) -> None:
-    while not state.shutdown_event.is_set():
+    pubsub = state.redis.pubsub()
+    await pubsub.subscribe("shutdown")
+    
+    while True:
+        message = await pubsub.get_message()
+        if message and message["data"] == b"1":
+            print("Shutdown signal received")
+            break
+        
         try:
-            task_obj = await asyncio.wait_for(state.tasks_to_run.get(), timeout=0.5)
+            task_data = await asyncio.wait_for(
+                state.redis.brpop("tasks_queue", timeout=1),
+                timeout=1.1
+            )
+            if task_data:
+                task_dict = json.loads(task_data[1])
+                # Convert string command to enum
+                if isinstance(task_dict["command"], str):
+                    task_dict["command"] = TaskType(task_dict["command"])
+                task = Task(**task_dict)
+                await process_tasks(state, task)
+
         except asyncio.TimeoutError:
             continue
-        try:
-            task = asyncio.create_task(process_tasks(state, task_obj))
-            async with state.running_lock:
-                state.running_tasks[task_obj.id] = task
-
-            try:
-                await task
-            finally:
-                async with state.running_lock:
-                    state.running_tasks.pop(task_obj.id, None)
-        finally:
-            state.tasks_to_run.task_done()
 
 async def start_workers(state: AppState, num_workers: int) -> List[asyncio.Task]:
     tasks: List[asyncio.Task] = []
@@ -107,3 +113,14 @@ async def stop_workers(worker_tasks: List[asyncio.Task]) -> None:
             await t
         except asyncio.CancelledError:
             pass
+
+
+async def run_workers_only(state: AppState, num_workers: int) -> None:
+    """Run worker-only mode (no server)"""
+    worker_tasks = await start_workers(state, num_workers)
+    state.system_ready.set()
+    
+    try:
+        await state.shutdown_event.wait()
+    finally:
+        await stop_workers(worker_tasks)

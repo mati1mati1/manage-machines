@@ -1,0 +1,49 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  main_instance_1:
+    build: .
+    ports:
+      - "8888:8888"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ROLE=server
+    depends_on:
+      - redis
+
+  worker_instance_1:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ROLE=worker
+      - NUM_WORKERS=50
+    depends_on:
+      - redis
+
+  worker_instance_2:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - ROLE=worker
+      - NUM_WORKERS=50
+    depends_on:
+      - redis
+
+  watchtower:
+    image: containrrr/watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 300 --cleanup
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=300
+
+volumes:
+  redis_data:
